@@ -2,17 +2,23 @@
 # FINSHIELD GUARDIAN: FASTAPI BACKEND MICROSERVICE
 # ==============================================================================
 
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
 from torch_geometric.nn import SAGEConv, HeteroConv
-import os
+
+# --- NEW: Import our newly created Engines ---
+from xai_engine import FraudExplainer
+from recommendation_engine import PreventionRecommender
 
 model = None
 graph_data = None
+xai_engine = None
+recommender = None
 OPTIMIZED_THRESHOLD = 0.9900
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -22,7 +28,7 @@ class FinShieldGraphSAGEOpt(nn.Module):
         self.node_emb = nn.Embedding(num_nodes, hidden_channels)
         self.conv1 = HeteroConv({('account', 'transacts', 'account'): SAGEConv((-1, -1), hidden_channels)}, aggr='mean')
         self.conv2 = HeteroConv({('account', 'transacts', 'account'): SAGEConv((-1, -1), hidden_channels)}, aggr='mean')
-        # Checkpoint එකට ගැලපෙන පරිදි edge_mlp ස්ථර නිවැරදි කරන ලදී
+        
         self.edge_mlp = nn.Sequential(
             nn.Linear(hidden_channels * 2 + in_edge_channels, 32),
             nn.ReLU(),
@@ -41,7 +47,7 @@ class FinShieldGraphSAGEOpt(nn.Module):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, graph_data
+    global model, graph_data, xai_engine, recommender
     print("[INFO] Loading FinShield model and graph artifacts...")
     
     GRAPH_PATH = 'finshield_hetero_graph.pt'
@@ -58,6 +64,12 @@ async def lifespan(app: FastAPI):
     model = FinShieldGraphSAGEOpt(num_nodes=NUM_NODES, in_edge_channels=IN_EDGE_CHANNELS, hidden_channels=32).to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
+    
+    # --- NEW: Initialize XAI and Recommendation Modules ---
+    print("[INFO] Initializing XAI and Recommendation Modules...")
+    xai_engine = FraudExplainer()
+    recommender = PreventionRecommender()
+    
     print("[SUCCESS] FinShield Guardian API ready to serve predictions!")
     
     yield
@@ -65,8 +77,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FinShield Guardian API",
-    description="Real-Time Heterogeneous Graph Neural Network Fraud Detection Engine",
-    version="1.0.0",
+    description="Real-Time Heterogeneous Graph Neural Network Fraud Detection Engine with XAI",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -74,6 +86,10 @@ class TransactionRequest(BaseModel):
     source_account_id: int
     dest_account_id: int
     edge_features: list[float]
+
+# --- NEW: Request Model for XAI Analysis ---
+class XAITransactionRequest(BaseModel):
+    transaction_edge_index: int  # The specific transaction ID/Index from the dataset
 
 @app.post("/predict-fraud")
 def predict_fraud(payload: TransactionRequest):
@@ -107,5 +123,41 @@ def predict_fraud(payload: TransactionRequest):
             "risk_level": "CRITICAL" if fraud_prob > 0.99 else ("MODERATE" if fraud_prob > 0.5 else "LOW")
         }
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- NEW: API Endpoint for Mobile App XAI & Recommendations ---
+@app.post("/api/v1/analyze_transaction")
+async def analyze_transaction(req: XAITransactionRequest):
+    try:
+        edge_type = ('account', 'transacts', 'account')
+        
+        # FIX: අදාළ Index එක පාවිච්චි කරලා ග්‍රාෆ් එකෙන් හරියටම Edge එකයි ඒකෙ Features ටිකයි වෙන් කරගැනීම
+        target_edge = xai_engine.graph_data[edge_type].edge_index[:, req.transaction_edge_index : req.transaction_edge_index + 1]
+        target_edge_attr = xai_engine.graph_data[edge_type].edge_attr[req.transaction_edge_index : req.transaction_edge_index + 1]
+        
+        # FIX: Run XAI Explainer passing BOTH target_edge and target_edge_attr
+        exp_result, sub_nodes, sub_edges = xai_engine.explain_transaction(target_edge, target_edge_attr)
+        
+        if exp_result is None:
+            raise HTTPException(status_code=500, detail="Failed to generate XAI explanation.")
+            
+        # Extract Risk Score and Top Factors
+        mask_dict = exp_result.edge_mask_dict if hasattr(exp_result, 'edge_mask_dict') else exp_result.edge_mask
+        
+        # Using the XAI importance max as a proxy risk score for the recommendation engine
+        risk_score = mask_dict[edge_type].max().item()
+        
+        # Simulate detected factors based on score
+        detected_factors = []
+        if risk_score > 0.75:
+            detected_factors.append("fraud_ring_proximity")
+            detected_factors.append("new_device")
+            
+        # Generate Personalized Recommendations
+        final_response = recommender.generate_recommendations(risk_score, detected_factors)
+        
+        return final_response
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
